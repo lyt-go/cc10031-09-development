@@ -479,6 +479,176 @@ class TestSnapshotChain:
         assert snap_file.exists()
 
 
+class TestArchiveSealChain:
+    """链路11: 归档封存质量报告与归并结果、报告更正与快照下载资格。
+
+    场景：同一测点一份暂缺质检与一份质检已完成的窗口结果；
+    归档途中提交报告更正；检查各快照可否用于后续序列下载及各自采用的质量判断。
+    """
+
+    def _prepare_point(self, setup_data_dir, point: str):
+        """准备同测点的降采样数据、两个归并窗口（W1 暂缺质检 / W2 质检已完成）。"""
+        import json as _json
+        from app.services.rollup_window import RollupWindowService
+        from app.services.series_quality import SeriesQualityService
+        from app.store import store
+
+        # 降采样数据 20 条（10.0 ~ 29.0），供两个窗口归并
+        ds_data = [{"task_id": "DOWN-ARC", "point": point, "window_index": i + 1,
+                    "aggregated_value": 10.0 + i, "method": "均值"} for i in range(20)]
+        (setup_data_dir / "downsampled").mkdir(parents=True, exist_ok=True)
+        with open(setup_data_dir / "downsampled" / f"DOWN-{point}_downsampled.jsonl", "w", encoding="utf-8") as f:
+            for d in ds_data:
+                f.write(_json.dumps(d, ensure_ascii=False) + "\n")
+        # 标定数据（无重复无越界 → 质检结论合格）
+        cal_data = [{"point": point, "timestamp": f"2026-09-01T10:{i:02d}:00",
+                     "calibrated_value_V": 20.0 + i} for i in range(10)]
+        (setup_data_dir / "calibrated").mkdir(parents=True, exist_ok=True)
+        with open(setup_data_dir / "calibrated" / f"{point}_calibrated.jsonl", "w", encoding="utf-8") as f:
+            for d in cal_data:
+                f.write(_json.dumps(d, ensure_ascii=False) + "\n")
+
+        # 同一测点的两个归并窗口：ROLL-ARC-A（暂缺质检）、ROLL-ARC-B（质检已完成）
+        for rid, wno in ((301, "ROLL-ARC-A"), (302, "ROLL-ARC-B")):
+            store.rows("rollup_window").append({
+                "id": rid, "窗口编号": wno, "测点编号": point,
+                "窗口类型": "固定窗口", "窗口长度": "5", "滑动步长": "1",
+                "聚合指标": "均值", "窗口条数": "0", "归并水位": "0",
+                "status": "待归并", "pending": True, "abnormal": False})
+        rw_svc = RollupWindowService()
+        rw_svc.rollup_windows(301)
+        rw_svc.rollup_windows(302)
+
+        # 质量报告只覆盖 ROLL-ARC-B → W1 暂缺质检，W2 质检已完成
+        store.rows("series_quality").append({
+            "id": 303, "报告编号": "QUAL-ARC-B", "测点编号": point,
+            "统计窗口": "2026-09-01", "完整率": "0", "重复点数": "0", "越界点数": "0",
+            "校验规则": "完整性+重复+越界", "质检结论": "", "覆盖窗口": "ROLL-ARC-B",
+            "status": "待质检", "pending": True, "abnormal": False})
+        sq_svc = SeriesQualityService()
+        check = sq_svc.run_quality_check(303)
+        assert check["conclusion"] == "合格"
+        return store
+
+    def _add_snapshot(self, store, sid: int, snap_no: str, point: str, covers: str):
+        store.rows("series_snapshot").append({
+            "id": sid, "快照编号": snap_no, "口径说明": "归并+质量", "测点范围": point,
+            "时间范围": "2026-09-01", "序列条数": "0", "生成方式": "", "快照水位": "0",
+            "生成时间": "", "覆盖窗口": covers,
+            "status": "草稿", "pending": True, "abnormal": False})
+
+    def test_seal_correction_and_download_eligibility(self, setup_data_dir):
+        import json as _json
+        from app.services.series_quality import SeriesQualityService
+        from app.services.series_snapshot import SeriesSnapshotService
+        from app.store import store
+
+        point = "SENS-ARC"
+        self._prepare_point(setup_data_dir, point)
+        ss_svc = SeriesSnapshotService()
+
+        # 1) S1 覆盖暂缺质检的 W1 → 归档被拒绝，交接记为已驳回
+        self._add_snapshot(store, 304, "SNAP-ARC-1", point, "ROLL-ARC-A")
+        ss_svc.create_snapshot(304)
+        rejected = ss_svc.archive_snapshot(304)
+        assert "error" in rejected
+        assert rejected["unsealed_windows"] == ["ROLL-ARC-A"]
+        assert store.find("series_snapshot", 304)["status"] != "已归档"
+
+        # 未封存的窗口不能通过更改快照状态被当作已交付
+        entry, message = ss_svc.run_action(304, "标记归档")
+        assert entry is None
+        assert "未封存" in message
+        assert store.find("series_snapshot", 304)["status"] != "已归档"
+
+        # 2) S2 覆盖质检已完成的 W2 → 归档成功，封存报告与归并结果作为归档依据
+        self._add_snapshot(store, 305, "SNAP-ARC-2", point, "ROLL-ARC-B")
+        ss_svc.create_snapshot(305)
+        archived = ss_svc.archive_snapshot(305)
+        assert archived["status"] == "已归档"
+        assert archived["sealed_windows"] == 1
+        assert archived["sealed_reports"] == 1
+        seal_file = setup_data_dir / "archive_seals" / "SNAP-ARC-2_seal.jsonl"
+        assert seal_file.exists()
+        manifest = [ _json.loads(line) for line in
+                     seal_file.read_text(encoding="utf-8").strip().split("\n") if line.strip()]
+        kinds = {m["kind"] for m in manifest}
+        assert kinds == {"rollup_window", "quality_report"}
+        win = next(m for m in manifest if m["kind"] == "rollup_window")
+        assert win["window_id"] == "ROLL-ARC-B"
+        assert win["quality_conclusion"] == "合格"
+        assert win["quality_source"] == "报告:QUAL-ARC-B"
+        # 关联合计冻结：4 个窗口均值 12+17+22+27 = 78
+        assert win["cumulative_total"] == 78.0
+
+        # 3) S3 发布（归档途中，交接进行中）；新报告到达 → 判定适用于进行中的交接
+        self._add_snapshot(store, 306, "SNAP-ARC-3", point, "ROLL-ARC-B")
+        ss_svc.create_snapshot(306)
+        store.rows("series_quality").append({
+            "id": 307, "报告编号": "QUAL-ARC-NEW", "测点编号": point,
+            "统计窗口": "2026-09-01", "完整率": "0", "重复点数": "0", "越界点数": "0",
+            "校验规则": "完整性+重复+越界", "质检结论": "", "覆盖窗口": "ROLL-ARC-B",
+            "status": "待质检", "pending": True, "abnormal": False})
+        SeriesQualityService().run_quality_check(307)
+        classified = ss_svc.classify_report_handover(307)
+        assert classified["handover_id"] == "HO-SNAP-ARC-3"
+        assert classified["handover_status"] == "进行中"
+
+        # 4) 归档途中提交报告更正 → 生成待复核窗口清单并标记已落实区间
+        corr = ss_svc.submit_report_correction("QUAL-ARC-B", "不合格", "1-20")
+        assert corr["duplicate"] is False
+        assert corr["review_tasks"] == 1  # 仅 S2 的封存交接引用过 QUAL-ARC-B
+        assert corr["applied_intervals"] == [
+            {"window_id": "ROLL-ARC-B", "window_start": 1.0, "window_end": 20.0}]
+        review_file = setup_data_dir / "archive_seals" / "review_tasks.jsonl"
+        tasks = [_json.loads(line) for line in
+                 review_file.read_text(encoding="utf-8").strip().split("\n") if line.strip()]
+        assert len(tasks) == 1
+        assert tasks[0]["status"] == "待复核"
+        assert tasks[0]["快照编号"] == "SNAP-ARC-2"
+
+        # 重复提交同一更正 → 不重复登记已落实的补审工作
+        dup = ss_svc.submit_report_correction("QUAL-ARC-B", "不合格", "1-20")
+        assert dup["duplicate"] is True
+        assert dup["review_tasks"] == 1
+        tasks_after = [_json.loads(line) for line in
+                       review_file.read_text(encoding="utf-8").strip().split("\n") if line.strip()]
+        assert len(tasks_after) == 1
+        corrections = [_json.loads(line) for line in
+                       (setup_data_dir / "archive_seals" / "corrections.jsonl")
+                       .read_text(encoding="utf-8").strip().split("\n") if line.strip()]
+        assert len(corrections) == 1
+
+        # 5) S3 在更正落实后归档 → 采用更正后的质量判断
+        archived3 = ss_svc.archive_snapshot(306)
+        assert archived3["status"] == "已归档"
+        manifest3 = [_json.loads(line) for line in
+                     (setup_data_dir / "archive_seals" / "SNAP-ARC-3_seal.jsonl")
+                     .read_text(encoding="utf-8").strip().split("\n") if line.strip()]
+        win3 = next(m for m in manifest3 if m["kind"] == "rollup_window")
+        assert win3["quality_conclusion"] == "不合格"
+        assert win3["quality_source"].startswith("更正:CORR-")
+
+        # 6) 旧快照保留其关联合计与封存时的质量判断，不被更正改写
+        manifest2_after = [_json.loads(line) for line in
+                           seal_file.read_text(encoding="utf-8").strip().split("\n") if line.strip()]
+        win2_after = next(m for m in manifest2_after if m["kind"] == "rollup_window")
+        assert win2_after["quality_conclusion"] == "合格"
+        assert win2_after["cumulative_total"] == 78.0
+
+        # 7) 检查哪些快照可用于后续序列下载、各自采用哪份质量判断
+        downloadable = ss_svc.downloadable_snapshots(point)
+        by_no = {s["快照编号"]: s for s in downloadable["snapshots"]}
+        assert by_no["SNAP-ARC-1"]["downloadable"] is False  # 未封存归档
+        assert by_no["SNAP-ARC-2"]["downloadable"] is True
+        assert by_no["SNAP-ARC-2"]["quality_judgment"] == {"ROLL-ARC-B": "合格"}
+        assert by_no["SNAP-ARC-2"]["associated_total"] == 78.0
+        assert by_no["SNAP-ARC-2"]["review_pending"] is True  # 封存报告已收到更正
+        assert by_no["SNAP-ARC-3"]["downloadable"] is True
+        assert by_no["SNAP-ARC-3"]["quality_judgment"] == {"ROLL-ARC-B": "不合格"}
+        assert by_no["SNAP-ARC-3"]["review_pending"] is False
+
+
 class TestErrorHandling:
     """异常场景：脏数据、重复批次、中断恢复"""
 
